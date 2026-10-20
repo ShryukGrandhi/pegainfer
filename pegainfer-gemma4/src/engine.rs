@@ -3275,6 +3275,7 @@ impl Scheduler for Gemma4Scheduler {
             num_running_reqs: (self.active.len() + walkers + lane_inflight) as u64,
             num_waiting_reqs: self.pending.len() as u64,
             spec_decode: None,
+            prefix_cache: None,
         }
     }
 }

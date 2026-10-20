@@ -572,6 +572,7 @@ async fn load_snapshots_become_stats_only_batches() {
         num_running_reqs: 2,
         num_waiting_reqs: 1,
         spec_decode: None,
+        prefix_cache: None,
     });
     let (output_tx, mut output_rx) = mpsc::unbounded_channel();
     let shutdown = CancellationToken::new();
@@ -675,6 +676,89 @@ async fn spec_stats_are_per_interval_deltas_that_skip_idle_intervals() {
     assert_eq!(spec.num_draft_tokens, 4);
     assert_eq!(spec.num_accepted_tokens, 4);
     assert_eq!(spec.num_accepted_tokens_per_pos, vec![2, 2]);
+
+    shutdown.cancel();
+    task.await
+        .expect("stats task exits on shutdown")
+        .expect("stats publisher shuts down cleanly");
+}
+
+/// Prefix-cache totals become per-interval deltas that the frontend `inc_by`s
+/// into `vllm:prefix_cache_{queries,hits}_total`, with hits split by tier. An
+/// engine restart (totals going backwards) diffs from zero instead of going
+/// negative, and an engine without a prefix cache exports zeros as before.
+#[tokio::test]
+async fn prefix_cache_stats_are_per_interval_deltas_across_a_restart() {
+    let mut totals = PrefixCacheCounters {
+        queries: 4096,
+        hits: 0,
+        device_hits: 0,
+        host_hits: 0,
+    };
+    let (load_tx, load_rx) = tokio::sync::watch::channel(SchedulerMetrics {
+        prefix_cache: Some(totals),
+        ..SchedulerMetrics::default()
+    });
+    let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(publish_scheduler_stats(
+        0,
+        load_rx,
+        output_tx,
+        shutdown.clone(),
+    ));
+
+    // First publish diffs against zero, so it carries the whole cumulative.
+    let first = next_scheduler_stats(&mut output_rx)
+        .await
+        .prefix_cache_stats;
+    assert_eq!(first.base.queries, 4096);
+    assert_eq!(first.base.hits, 0);
+
+    // A later turn: 4352 tokens looked up, 4096 of them served from cache.
+    totals.queries += 4352;
+    totals.hits += 4096;
+    totals.device_hits += 3072;
+    totals.host_hits += 1024;
+    load_tx.send_replace(SchedulerMetrics {
+        prefix_cache: Some(totals),
+        ..SchedulerMetrics::default()
+    });
+    let turn = next_scheduler_stats(&mut output_rx)
+        .await
+        .prefix_cache_stats;
+    assert_eq!(turn.base.queries, 4352);
+    assert_eq!(turn.base.hits, 4096);
+    assert_eq!(turn.hits_by_source.device, 3072);
+    assert_eq!(turn.hits_by_source.host, 1024);
+    assert_eq!(
+        turn.hits_by_source.counts().iter().sum::<u64>(),
+        turn.base.hits
+    );
+
+    // The engine restarts: totals fall below the baseline. The interval
+    // counts from zero rather than underflowing or dropping the new work.
+    load_tx.send_replace(SchedulerMetrics {
+        prefix_cache: Some(PrefixCacheCounters {
+            queries: 300,
+            hits: 200,
+            device_hits: 200,
+            host_hits: 0,
+        }),
+        ..SchedulerMetrics::default()
+    });
+    let restarted = next_scheduler_stats(&mut output_rx)
+        .await
+        .prefix_cache_stats;
+    assert_eq!(restarted.base.queries, 300);
+    assert_eq!(restarted.base.hits, 200);
+    assert_eq!(restarted.hits_by_source.device, 200);
+    assert_eq!(restarted.hits_by_source.host, 0);
+
+    // No prefix cache: the default stats, exactly what was exported before.
+    load_tx.send_replace(SchedulerMetrics::default());
+    let none = next_scheduler_stats(&mut output_rx).await;
+    assert_eq!(none.prefix_cache_stats, PrefixCacheStats::default());
 
     shutdown.cancel();
     task.await

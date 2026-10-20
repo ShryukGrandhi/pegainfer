@@ -825,6 +825,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
                 + self.loading.len()
                 + self.post_control_deferred.len()) as u64,
             spec_decode: self.executor.spec_decode_counters(),
+            prefix_cache: None,
         }
     }
 }

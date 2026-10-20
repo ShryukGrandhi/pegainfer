@@ -11,6 +11,8 @@ Two independent paths feed the upstream Prometheus registry (`vllm-metrics`, ser
 1. **Per-request path (works for every model crate).** The bridge stamps each request's first output with `Queued`/`Scheduled` timestamps and `PrefillStats` (prompt/computed/cached token split). The upstream `RequestMetricsTracker` turns those into `time_to_first_token_seconds`, `inter_token_latency_seconds`, `request_queue_time_seconds`, `prompt_tokens_total`, `generation_tokens_total`, `request_success_total`, `prompt_tokens_by_source_total`, … unconditionally — `disable_log_stats` only gates the periodic *text* logger, not Prometheus.
 2. **Engine-gauge path.** Step-contract schedulers publish `SchedulerMetrics { kv_used_blocks, kv_total_blocks, num_running_reqs, num_waiting_reqs }` through the shared driver's post-step metrics cell. The bridge reads the latest cell at startup and when forwarding a step; it is not a snapshot bound to that step's tokens. Metric-only changes send an empty step, so cancellation of the last request can reset the gauges. Unchanged idle iterations send nothing. Legacy schedulers use `LoadSnapshot` watches. Both bridges forward stats in `RequestBatchOutputs`, whose `engine_index` is both the routing identity and the Prometheus `engine` label.
 
+Cumulative counters ride the same snapshot and the bridge diffs consecutive snapshots into the per-interval deltas vLLM `inc_by`s. `spec_decode` feeds `vllm:spec_decode_*`. `prefix_cache: Option<PrefixCacheCounters>` (prompt tokens queried and hit, hits split into `device`/`host`) feeds `vllm:prefix_cache_{queries,hits}_total` through `SchedulerStats::prefix_cache_stats`. A total that goes backwards (engine restart) restarts the delta from zero. Pitfall: the pinned vLLM frontend credits every local hit to `prompt_tokens_cached_by_source{source="device"}` and ignores the local `hits_by_source`, so the bridge carries the host split on the wire but Prometheus shows it as `device` until upstream reads it.
+
 Qwen3.5 exposes one step-contract scheduler for both single-GPU and TP. For legacy engines, `EngineHandle::with_load_watch` keeps the original one-engine contract. A partitioned scheduler uses `with_load_watches`, and the frontend launch declares the same engine count; a mismatch fails startup. GLM5.2 EP8 therefore registers engines 0–7, each bound to its own pending queue and KV pool. TP8 registers only engine 0 because its eight workers mirror one logical request stream.
 
 Historical watch-path measurements found noise-level cost in both covered configurations:
@@ -20,10 +22,10 @@ Historical watch-path measurements found noise-level cost in both covered config
 
 ## What deliberately reads zero (state at capture time)
 
-- `prefix_cache_queries/hits` and the by-reason waiting split (`reason="deferred"` is driven by a skipped-request counter we don't report; all waiting shows as `reason="capacity"`).
+- `prefix_cache_queries/hits` for every in-tree model line (none fills `SchedulerMetrics::prefix_cache` yet; an out-of-tree `Scheduler` can), and the by-reason waiting split (`reason="deferred"` is driven by a skipped-request counter we don't report; all waiting shows as `reason="capacity"`).
 - Per-GPU FLOPs/bytes estimates, KV-block residency histograms, cudagraph stats — the bridge sends `SchedulerStats::default()` for these fields.
 - Every legacy model crate whose scheduler doesn't publish a `LoadSnapshot` watch (currently deepseek and kimi) gets path 1 only; its engine gauges are absent, not lying-zero — the bridge skips the stats task for that partition when no watch exists.
 
 ## Next step
 
-Next, wire the DeepSeek-V2-Lite and Kimi-K2 schedulers using the same recipe, and report real prefix-cache query/hit counters instead of zeros. A future partitioned model must expose its logical scheduler partitions instead of averaging them behind engine 0.
+Next, wire the DeepSeek-V2-Lite and Kimi-K2 schedulers using the same recipe, and have in-tree engines with a prefix cache (Gemma 4's `PEGAINFER_PREFIX_CACHE`) fill `SchedulerMetrics::prefix_cache`. A future partitioned model must expose its logical scheduler partitions instead of averaging them behind engine 0.

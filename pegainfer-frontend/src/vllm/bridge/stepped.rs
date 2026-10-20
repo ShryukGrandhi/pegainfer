@@ -39,11 +39,10 @@ use zeromq::ZmqMessage;
 use zeromq::prelude::SocketRecv;
 
 use super::BridgeLink;
-use super::SpecDecodeTracker;
+use super::StatsTracker;
 use super::connect_link;
 use super::engine_output;
 use super::now_secs_f64;
-use super::scheduler_stats_from;
 use super::send_outputs;
 use super::send_terminal_output;
 use super::send_utility_response;
@@ -87,7 +86,7 @@ impl SteppedEngineBridge {
             .scheduler
             .take_steps()
             .context("partition step stream already taken")?;
-        let mut spec = SpecDecodeTracker::default();
+        let mut tracker = StatsTracker::default();
         let Some(BridgeLink {
             mut input,
             output_tx,
@@ -111,7 +110,7 @@ impl SteppedEngineBridge {
             &output_tx,
             RequestBatchOutputs {
                 engine_index: self.engine_index,
-                scheduler_stats: Some(Box::new(self.stats(&mut spec))),
+                scheduler_stats: Some(Box::new(self.stats(&mut tracker))),
                 timestamp: now_secs_f64(),
                 ..Default::default()
             }
@@ -154,7 +153,7 @@ impl SteppedEngineBridge {
                         &anchor,
                         &mut streams,
                         &mut names,
-                        &mut spec,
+                        &mut tracker,
                         &output_tx,
                     ) {
                         break Err(error).context("failed to dispatch local engine step");
@@ -213,13 +212,10 @@ impl SteppedEngineBridge {
         run_result
     }
 
-    /// Stats for an outgoing batch; the spec delta runs from the last batch
-    /// stamped, not the last step run.
-    fn stats(&self, spec: &mut SpecDecodeTracker) -> SchedulerStats {
-        let snapshot = self.scheduler.metrics();
-        let mut stats = scheduler_stats_from(&snapshot);
-        stats.spec_decoding_stats = spec.interval(&snapshot);
-        stats
+    /// Stats for an outgoing batch; the counter deltas run from the last
+    /// batch stamped, not the last step run.
+    fn stats(&self, tracker: &mut StatsTracker) -> SchedulerStats {
+        tracker.stats(&self.scheduler.metrics())
     }
 
     fn dispatch_step(
@@ -228,7 +224,7 @@ impl SteppedEngineBridge {
         anchor: &UnixAnchor,
         streams: &mut HashMap<RequestId, SteppedStream>,
         names: &mut HashMap<String, RequestId>,
-        spec: &mut SpecDecodeTracker,
+        tracker: &mut StatsTracker,
         output_tx: &tokio::sync::mpsc::UnboundedSender<
             vllm_engine_core_client::protocol::output::EngineCoreOutputs,
         >,
@@ -261,7 +257,7 @@ impl SteppedEngineBridge {
                 engine_index: self.engine_index,
                 outputs,
                 finished_requests: (!finished_requests.is_empty()).then_some(finished_requests),
-                scheduler_stats: Some(Box::new(self.stats(spec))),
+                scheduler_stats: Some(Box::new(self.stats(tracker))),
                 timestamp: now_secs_f64(),
             }
             .into(),
@@ -754,7 +750,7 @@ mod tests {
         )]);
         let bridge = bridge(handle);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut spec = SpecDecodeTracker::default();
+        let mut tracker = StatsTracker::default();
         for (running, updates) in [(1, vec![scheduled]), (0, Vec::new())] {
             backend.metrics.publish(&crate::engine::SchedulerMetrics {
                 num_running_reqs: running,
@@ -766,7 +762,7 @@ mod tests {
                     &UnixAnchor::now(),
                     &mut streams,
                     &mut HashMap::new(),
-                    &mut spec,
+                    &mut tracker,
                     &tx,
                 )
                 .unwrap();
