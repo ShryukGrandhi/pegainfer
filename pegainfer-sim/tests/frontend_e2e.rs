@@ -890,7 +890,6 @@ impl Scheduler for TieredPrefixCacheScheduler {
             let turn = self.turns.next().context("no scripted turn left")?;
             self.totals.queries += turn.queries;
             self.totals.hits += turn.hits;
-            self.totals.device_hits += turn.device_hits;
             self.totals.host_queries += turn.host_queries;
             self.totals.host_hits += turn.host_hits;
             ledger.push_tokens(id, &[0], &[]);
@@ -927,7 +926,6 @@ async fn stepped_bridge_reports_prefix_cache_hits_by_tier_to_prometheus() -> Res
             PrefixCacheCounters {
                 queries: 4352,
                 hits: 4096,
-                device_hits: 3072,
                 host_queries: 1280,
                 host_hits: 1024,
             },

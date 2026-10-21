@@ -638,20 +638,18 @@ fn spec_decode_delta(last: &SpecDecodeCounters, cur: &SpecDecodeCounters) -> Spe
 /// shape the frontend increments its prefix-cache counters by. The frontend
 /// credits every local hit to `source="device"` and reads a tier split only off
 /// the connector stats, so host-tier hits travel there, the way vLLM's own
-/// offload connector reports them: local stats carry the device hits (plus any
-/// the engine does not split out) into `vllm:prefix_cache_*`, connector stats
-/// carry the host lookups and hits into `vllm:external_prefix_cache_*` and
-/// `source="host"`. The connector side is `None` for an interval without host
-/// activity. A total below its baseline means the engine restarted, so the
-/// interval diffs from zero rather than going negative or dropping the new
-/// counts.
+/// offload connector reports them: local stats carry the remaining hits into
+/// `vllm:prefix_cache_*` and `source="device"`, connector stats carry the host
+/// lookups and hits into `vllm:external_prefix_cache_*` and `source="host"`.
+/// The connector side is `None` for an interval without host activity. A total
+/// below its baseline means the engine restarted, so the interval diffs from
+/// zero rather than going negative or dropping the new counts.
 fn prefix_cache_delta(
     last: &PrefixCacheCounters,
     cur: &PrefixCacheCounters,
 ) -> (PrefixCacheStats, Option<PrefixCacheStats>) {
     let restarted = cur.queries < last.queries
         || cur.hits < last.hits
-        || cur.device_hits < last.device_hits
         || cur.host_queries < last.host_queries
         || cur.host_hits < last.host_hits;
     let base = if restarted {
@@ -667,10 +665,6 @@ fn prefix_cache_delta(
             queries: cur.queries - base.queries,
             hits: hits.saturating_sub(host_hits),
             ..BaseCacheStats::default()
-        },
-        hits_by_source: CachedTokensBySource {
-            device: cur.device_hits - base.device_hits,
-            ..CachedTokensBySource::default()
         },
         ..PrefixCacheStats::default()
     };

@@ -694,7 +694,6 @@ async fn prefix_cache_stats_are_per_interval_deltas_across_a_restart() {
     let mut totals = PrefixCacheCounters {
         queries: 4096,
         hits: 0,
-        device_hits: 0,
         host_queries: 0,
         host_hits: 0,
     };
@@ -722,7 +721,6 @@ async fn prefix_cache_stats_are_per_interval_deltas_across_a_restart() {
     // the 1280 that missed device were looked up in host, which had 1024.
     totals.queries += 4352;
     totals.hits += 4096;
-    totals.device_hits += 3072;
     totals.host_queries += 1280;
     totals.host_hits += 1024;
     load_tx.send_replace(SchedulerMetrics {
@@ -753,7 +751,6 @@ async fn prefix_cache_stats_are_per_interval_deltas_across_a_restart() {
         prefix_cache: Some(PrefixCacheCounters {
             queries: 300,
             hits: 200,
-            device_hits: 200,
             host_queries: 0,
             host_hits: 0,
         }),
@@ -762,7 +759,6 @@ async fn prefix_cache_stats_are_per_interval_deltas_across_a_restart() {
     let restarted = next_scheduler_stats(&mut output_rx).await;
     assert_eq!(restarted.prefix_cache_stats.base.queries, 300);
     assert_eq!(restarted.prefix_cache_stats.base.hits, 200);
-    assert_eq!(restarted.prefix_cache_stats.hits_by_source.device, 200);
     assert_eq!(restarted.connector_prefix_cache_stats, None);
 
     // No prefix cache: the default stats, exactly what was exported before.
