@@ -12,7 +12,9 @@ use anyhow::anyhow;
 use anyhow::bail;
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineInfo;
+use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::LiveScheduler;
+use pegainfer_frontend::engine::PrefixCacheCounters;
 use pegainfer_frontend::engine::QueuedRequest;
 use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestLedger;
@@ -40,6 +42,7 @@ const MODEL_NAME: &str = "pegainfer-sim-e2e";
 const METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-metrics";
 const SLOW_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-slow-metrics";
 const SPEC_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-spec-metrics";
+const PREFIX_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-prefix-metrics";
 const PROFILE_GATE_MODEL_NAME: &str = "pegainfer-sim-online-gate";
 const ZERO_COST_MODEL_NAME: &str = "pegainfer-sim-zero-cost";
 /// The pretend drafter the spec-metrics server runs: `K` and how many of those
@@ -867,6 +870,116 @@ impl Scheduler for HoldScheduler {
     }
 }
 
+/// One prefix-cache lookup per admitted request, taken from a fixed script of
+/// turns, published as cumulative totals the way a tiered engine does; each
+/// request then finishes after one token.
+struct TieredPrefixCacheScheduler {
+    turns: std::vec::IntoIter<PrefixCacheCounters>,
+    queued: Vec<RequestId>,
+    totals: PrefixCacheCounters,
+}
+
+impl Scheduler for TieredPrefixCacheScheduler {
+    fn submit(&mut self, request: QueuedRequest) {
+        self.queued.push(request.id);
+    }
+
+    fn step(&mut self, ledger: &mut RequestLedger) -> Result<()> {
+        for id in self.queued.drain(..) {
+            ledger.admit(id);
+            let turn = self.turns.next().context("no scripted turn left")?;
+            self.totals.queries += turn.queries;
+            self.totals.hits += turn.hits;
+            self.totals.device_hits += turn.device_hits;
+            self.totals.host_queries += turn.host_queries;
+            self.totals.host_hits += turn.host_hits;
+            ledger.push_tokens(id, &[0], &[]);
+            ledger.finish(id, FinishReason::Length);
+        }
+        Ok(())
+    }
+
+    fn metrics(&self) -> SchedulerMetrics {
+        SchedulerMetrics {
+            num_waiting_reqs: self.queued.len() as u64,
+            prefix_cache: Some(self.totals),
+            ..SchedulerMetrics::default()
+        }
+    }
+}
+
+/// A scheduler that serves hits from both tiers reaches `/metrics` with the
+/// split intact: device hits in `vllm:prefix_cache_*` and `source="device"`,
+/// host lookups and hits in `vllm:external_prefix_cache_*` and
+/// `source="host"`. The frontend credits every local hit to device, so a host
+/// hit carried as a local one would export as device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stepped_bridge_reports_prefix_cache_hits_by_tier_to_prometheus() -> Result<()> {
+    let scheduler = TieredPrefixCacheScheduler {
+        turns: vec![
+            // A cold turn: 4096 tokens looked up, none cached.
+            PrefixCacheCounters {
+                queries: 4096,
+                ..PrefixCacheCounters::default()
+            },
+            // A later turn: 4352 looked up, 3072 resident on device; the 1280
+            // that missed device were looked up in host, which had 1024.
+            PrefixCacheCounters {
+                queries: 4352,
+                hits: 4096,
+                device_hits: 3072,
+                host_queries: 1280,
+                host_hits: 1024,
+            },
+        ]
+        .into_iter(),
+        queued: Vec::new(),
+        totals: PrefixCacheCounters::default(),
+    };
+    let (base_url, _server, _model_dir) = serve_schedulers_as(
+        PREFIX_METRICS_MODEL_NAME,
+        vec![spawn_scheduler("tiered-prefix", scheduler)],
+    )
+    .await?;
+    let client = test_client()?;
+    for _ in 0..2 {
+        post_completion(&client, &base_url, PREFIX_METRICS_MODEL_NAME, false).await?;
+    }
+
+    wait_for_metrics(
+        &client,
+        &base_url,
+        &[
+            ("vllm:prefix_cache_queries_total", "0", 8448.0),
+            ("vllm:prefix_cache_hits_total", "0", 3072.0),
+            ("vllm:external_prefix_cache_queries_total", "0", 1280.0),
+            ("vllm:external_prefix_cache_hits_total", "0", 1024.0),
+        ],
+        PREFIX_METRICS_MODEL_NAME,
+    )
+    .await?;
+    wait_for_labeled_metrics(
+        &client,
+        &base_url,
+        &[
+            (
+                "vllm:prompt_tokens_cached_by_source_total",
+                "0",
+                &[("source", "device")][..],
+                3072.0,
+            ),
+            (
+                "vllm:prompt_tokens_cached_by_source_total",
+                "0",
+                &[("source", "host")][..],
+                1024.0,
+            ),
+        ],
+        PREFIX_METRICS_MODEL_NAME,
+    )
+    .await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn frontend_shuts_down_when_its_scheduler_panics() -> Result<()> {
     let scheduler = FatalScheduler {
@@ -917,6 +1030,15 @@ async fn a_failed_scheduler_answers_and_stops_the_other_engines() -> Result<()> 
 async fn serve_schedulers(
     schedulers: Vec<LiveScheduler>,
 ) -> Result<(String, oneshot::Receiver<Result<()>>, TempDir)> {
+    serve_schedulers_as(MODEL_NAME, schedulers).await
+}
+
+/// [`serve_schedulers`] under `model_name`, so a test's counters are not
+/// shared with other servers in this process.
+async fn serve_schedulers_as(
+    model_name: &str,
+    schedulers: Vec<LiveScheduler>,
+) -> Result<(String, oneshot::Receiver<Result<()>>, TempDir)> {
     let model_dir = model_dir_with_minimal_metadata()?;
     let port = reserve_loopback_port()?;
     let engine_count = schedulers.len();
@@ -929,6 +1051,7 @@ async fn serve_schedulers(
         lora: None,
     };
     let model_path = model_dir.path().to_path_buf();
+    let model_name = model_name.to_string();
     let (done_tx, done) = oneshot::channel();
     std::thread::spawn(move || {
         let result = tokio::runtime::Runtime::new()
@@ -937,7 +1060,7 @@ async fn serve_schedulers(
                 runtime.block_on(pegainfer_frontend::vllm::serve_with_engine_count(
                     std::future::ready(Ok(engine.into())),
                     &model_path,
-                    vec![MODEL_NAME.to_string()],
+                    vec![model_name],
                     pegainfer_frontend::vllm::ParserSelection::Auto,
                     port,
                     Some(128),
