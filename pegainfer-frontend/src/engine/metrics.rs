@@ -35,7 +35,7 @@ pub struct SchedulerMetrics {
 /// Cumulative prefix-cache counters in prompt tokens, monotone since the
 /// engine started (totals for the same reason as [`SpecDecodeCounters`]).
 /// `device_hits + host_hits` never exceeds `hits`; a tier the engine does not
-/// split out is counted in `hits` only.
+/// split out is counted in `hits` only and reported as a device hit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PrefixCacheCounters {
     /// Prompt tokens looked up in the prefix cache.
@@ -44,6 +44,8 @@ pub struct PrefixCacheCounters {
     pub hits: u64,
     /// Of `hits`, tokens already resident in device memory.
     pub device_hits: u64,
+    /// Prompt tokens looked up in the host tier; zero without one.
+    pub host_queries: u64,
     /// Of `hits`, tokens restored from host memory.
     pub host_hits: u64,
 }

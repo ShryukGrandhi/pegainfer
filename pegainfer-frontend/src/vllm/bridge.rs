@@ -634,33 +634,59 @@ fn spec_decode_delta(last: &SpecDecodeCounters, cur: &SpecDecodeCounters) -> Spe
     }
 }
 
-/// Per-interval prefix-cache delta from two cumulative snapshots, in the wire
-/// shape the frontend increments its `vllm:prefix_cache_*_total` counters by.
-/// A total below its baseline means the engine restarted, so the interval
-/// diffs from zero rather than going negative or dropping the new counts.
-fn prefix_cache_delta(last: &PrefixCacheCounters, cur: &PrefixCacheCounters) -> PrefixCacheStats {
+/// Per-interval prefix-cache deltas from two cumulative snapshots, in the wire
+/// shape the frontend increments its prefix-cache counters by. The frontend
+/// credits every local hit to `source="device"` and reads a tier split only off
+/// the connector stats, so host-tier hits travel there, the way vLLM's own
+/// offload connector reports them: local stats carry the device hits (plus any
+/// the engine does not split out) into `vllm:prefix_cache_*`, connector stats
+/// carry the host lookups and hits into `vllm:external_prefix_cache_*` and
+/// `source="host"`. The connector side is `None` for an interval without host
+/// activity. A total below its baseline means the engine restarted, so the
+/// interval diffs from zero rather than going negative or dropping the new
+/// counts.
+fn prefix_cache_delta(
+    last: &PrefixCacheCounters,
+    cur: &PrefixCacheCounters,
+) -> (PrefixCacheStats, Option<PrefixCacheStats>) {
     let restarted = cur.queries < last.queries
         || cur.hits < last.hits
         || cur.device_hits < last.device_hits
+        || cur.host_queries < last.host_queries
         || cur.host_hits < last.host_hits;
     let base = if restarted {
         PrefixCacheCounters::default()
     } else {
         *last
     };
-    PrefixCacheStats {
+    let hits = cur.hits - base.hits;
+    let host_queries = cur.host_queries - base.host_queries;
+    let host_hits = cur.host_hits - base.host_hits;
+    let local = PrefixCacheStats {
         base: BaseCacheStats {
             queries: cur.queries - base.queries,
-            hits: cur.hits - base.hits,
+            hits: hits.saturating_sub(host_hits),
             ..BaseCacheStats::default()
         },
         hits_by_source: CachedTokensBySource {
             device: cur.device_hits - base.device_hits,
-            host: cur.host_hits - base.host_hits,
             ..CachedTokensBySource::default()
         },
         ..PrefixCacheStats::default()
-    }
+    };
+    let connector = (host_queries > 0 || host_hits > 0).then(|| PrefixCacheStats {
+        base: BaseCacheStats {
+            queries: host_queries,
+            hits: host_hits,
+            ..BaseCacheStats::default()
+        },
+        hits_by_source: CachedTokensBySource {
+            host: host_hits,
+            ..CachedTokensBySource::default()
+        },
+        ..PrefixCacheStats::default()
+    });
+    (local, connector)
 }
 
 /// Turns the scheduler's cumulative counters into the per-interval deltas
@@ -679,7 +705,8 @@ impl StatsTracker {
         let mut stats = scheduler_stats_from(snapshot);
         stats.spec_decoding_stats = self.spec_decode_interval(snapshot);
         if let Some(cur) = &snapshot.prefix_cache {
-            stats.prefix_cache_stats = prefix_cache_delta(&self.prefix_cache, cur);
+            (stats.prefix_cache_stats, stats.connector_prefix_cache_stats) =
+                prefix_cache_delta(&self.prefix_cache, cur);
             self.prefix_cache = *cur;
         } else {
             // Reset so a prefix cache that shows up later diffs from zero.
